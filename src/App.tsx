@@ -60,6 +60,11 @@ import {
   parseJoinPayloadFromLocation,
   getOrCreateTripPin,
 } from './utils/shareTrip';
+import {
+  subscribeToTripLive,
+  broadcastTripEvent,
+  type LiveSyncEvent,
+} from './services/liveTripSync';
 import { DashboardView } from './components/DashboardView';
 import { PoolView } from './components/PoolView';
 import { TransferView } from './components/TransferView';
@@ -149,6 +154,7 @@ export default function App() {
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
   const [copiedPin, setCopiedPin] = useState<boolean>(false);
   const [joinWithPinModalOpen, setJoinWithPinModalOpen] = useState<boolean>(false);
+  const [isLiveSyncConnected, setIsLiveSyncConnected] = useState<boolean>(false);
 
   // Auto-dismiss status toast after 4 seconds
   useEffect(() => {
@@ -466,6 +472,86 @@ export default function App() {
     }
   }, [inviteModalOpen, activeTrip, transactions, activeTripPin]);
 
+  // Real-Time Live Sync Engine: Connects all friends on this trip over SSE
+  useEffect(() => {
+    if (!activeTrip?.id) return;
+
+    const unsubscribe = subscribeToTripLive(
+      activeTrip.id,
+      async (event: LiveSyncEvent) => {
+        if (event.type === 'TRANSACTION_SAVED' && event.tx) {
+          const incomingTx = event.tx;
+          await saveTransactionLocal(incomingTx);
+          setTransactions((prev) => {
+            const idx = prev.findIndex((item) => item.id === incomingTx.id);
+            if (idx >= 0) {
+              const copy = [...prev];
+              copy[idx] = incomingTx;
+              return copy;
+            }
+            return [incomingTx, ...prev];
+          });
+
+          const isContrib = incomingTx.type === 'CONTRIBUTION';
+          const title = isContrib
+            ? `Pool deposit ${formatCurrency(incomingTx.amountPaise, incomingTx.currency)}`
+            : `Expense "${incomingTx.title}" (${formatCurrency(incomingTx.amountPaise, incomingTx.currency)})`;
+          setStatusToast({
+            message: `⚡ Live Update: ${title} synced!`,
+            type: 'SUCCESS',
+          });
+        } else if (event.type === 'TRANSACTION_DELETED' && event.txId) {
+          await deleteTransactionLocal(event.txId);
+          setTransactions((prev) => prev.filter((item) => item.id !== event.txId));
+          setStatusToast({
+            message: `⚡ Live Update: Transaction removed by group`,
+            type: 'INFO',
+          });
+        } else if (event.type === 'TRIP_UPDATED' && event.trip) {
+          await saveTripLocal(event.trip);
+          setTrips((prev) => prev.map((t) => (t.id === event.trip!.id ? event.trip! : t)));
+          setStatusToast({
+            message: `⚡ Live Update: Trip details updated!`,
+            type: 'SUCCESS',
+          });
+        } else if (event.type === 'REQUEST_SYNC') {
+          // A friend just joined or requested sync, reply with current snapshot
+          const tripTxs = transactions.filter((tx) => tx.tripId === activeTrip.id);
+          broadcastTripEvent(activeTrip.id, {
+            type: 'SYNC_SNAPSHOT',
+            trip: activeTrip,
+            transactions: tripTxs,
+          });
+        } else if (event.type === 'SYNC_SNAPSHOT' && event.trip && event.transactions) {
+          const res = await importSharedTripData(event.trip, event.transactions);
+          setTrips(res.trips);
+          setTransactions(res.transactions);
+          if (res.importedTxCount > 0 || res.updatedTxCount > 0) {
+            setStatusToast({
+              message: `⚡ Live Update: Synced ${res.importedTxCount} new transaction(s)!`,
+              type: 'SUCCESS',
+            });
+          }
+        }
+      },
+      (connected) => {
+        setIsLiveSyncConnected(connected);
+      }
+    );
+
+    // Initial broadcast of snapshot so any listening friend gets our current data (e.g. ₹4000 contribution!)
+    const currentTripTxs = transactions.filter((tx) => tx.tripId === activeTrip.id);
+    if (currentTripTxs.length > 0) {
+      broadcastTripEvent(activeTrip.id, {
+        type: 'SYNC_SNAPSHOT',
+        trip: activeTrip,
+        transactions: currentTripTxs,
+      });
+    }
+
+    return () => unsubscribe();
+  }, [activeTrip?.id]);
+
   const appendTransaction = async (tx: Transaction, auditNote: string) => {
     const actorName =
       activeTrip?.members.find((m) => m.id === activeTrip.treasurerMemberId)?.name ||
@@ -497,6 +583,14 @@ export default function App() {
     setTransactions((prev) => [preparedTx, ...prev]);
     setAuditLogs((prev) => [log, ...prev]);
     setSyncError(null);
+
+    // Live Broadcast to all friends connected to this trip
+    if (activeTrip?.id) {
+      broadcastTripEvent(activeTrip.id, {
+        type: 'TRANSACTION_SAVED',
+        tx: preparedTx,
+      });
+    }
   };
 
   const handleAddContribution = async (input: {
@@ -706,6 +800,17 @@ export default function App() {
       ...prev.map((item) => (item.id === originalTx.id ? updatedOriginal : item)),
     ]);
     setAuditLogs((prev) => [auditLog, ...prev]);
+
+    if (activeTrip?.id) {
+      broadcastTripEvent(activeTrip.id, {
+        type: 'TRANSACTION_SAVED',
+        tx: updatedOriginal,
+      });
+      broadcastTripEvent(activeTrip.id, {
+        type: 'TRANSACTION_SAVED',
+        tx: reversalEntry,
+      });
+    }
   };
 
   const handleUpdateFullTransaction = async (updatedTx: Transaction) => {
@@ -740,6 +845,13 @@ export default function App() {
       prev.map((item) => (item.id === updatedTx.id ? updatedTx : item))
     );
     setAuditLogs((prev) => [log, ...prev]);
+
+    if (activeTrip?.id) {
+      broadcastTripEvent(activeTrip.id, {
+        type: 'TRANSACTION_SAVED',
+        tx: updatedTx,
+      });
+    }
   };
 
   const handleDeleteTransaction = async (tx: Transaction) => {
@@ -762,6 +874,13 @@ export default function App() {
     await deleteTransactionLocal(tx.id, log);
     setTransactions((prev) => prev.filter((item) => item.id !== tx.id));
     setAuditLogs((prev) => [log, ...prev]);
+
+    if (activeTrip?.id) {
+      broadcastTripEvent(activeTrip.id, {
+        type: 'TRANSACTION_DELETED',
+        txId: tx.id,
+      });
+    }
   };
 
   const handleEditTransaction = async (
@@ -803,6 +922,11 @@ export default function App() {
       return [tripObj, ...prev];
     });
     setActiveTripId(tripObj.id);
+
+    broadcastTripEvent(tripObj.id, {
+      type: 'TRIP_UPDATED',
+      trip: tripObj,
+    });
   };
 
   const handleJoinTripFromPayload = async ({
@@ -846,6 +970,20 @@ export default function App() {
       return true;
     }
     return false;
+  };
+
+  const handleManualBroadcast = async () => {
+    if (!activeTrip) return;
+    const currentTxs = transactions.filter((tx) => tx.tripId === activeTrip.id);
+    await broadcastTripEvent(activeTrip.id, {
+      type: 'SYNC_SNAPSHOT',
+      trip: activeTrip,
+      transactions: currentTxs,
+    });
+    setStatusToast({
+      message: `⚡ Live Synced ${currentTxs.length} transactions to all friends!`,
+      type: 'SUCCESS',
+    });
   };
 
   const handleAddMemberInline = async (memberName: string): Promise<string | null> => {
@@ -1266,6 +1404,7 @@ export default function App() {
               setTripModalState({ open: true, editingTrip: activeTrip })
             }
             onOpenInviteModal={() => setInviteModalOpen(true)}
+            onManualLiveSync={handleManualBroadcast}
             onRequestDeleteTrip={() => setDeleteTripConfirmOpen(true)}
             onSaveTripInline={handleSaveTrip}
             onAddMemberInline={handleAddMemberInline}

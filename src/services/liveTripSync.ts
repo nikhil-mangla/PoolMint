@@ -1,0 +1,162 @@
+import type { Trip, Transaction } from '../types/treasury.ts';
+
+// Unique client identifier for this tab/session to avoid echoing our own events
+export const CLIENT_ID =
+  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : 'cli_' + Math.random().toString(36).slice(2, 10);
+
+export type LiveSyncEventType =
+  | 'TRANSACTION_SAVED'
+  | 'TRANSACTION_DELETED'
+  | 'TRIP_UPDATED'
+  | 'REQUEST_SYNC'
+  | 'SYNC_SNAPSHOT';
+
+export interface LiveSyncEvent {
+  type: LiveSyncEventType;
+  tripId: string;
+  senderClientId: string;
+  timestamp: string;
+  tx?: Transaction;
+  txId?: string;
+  trip?: Trip;
+  transactions?: Transaction[];
+}
+
+/**
+ * Returns a clean, unique sync topic for a given trip.
+ */
+export function getTripSyncTopic(tripId: string): string {
+  // Use a predictable, secure topic name based on trip id
+  return 'pm_sync_' + tripId.replace(/[^a-zA-Z0-9]/g, '_');
+}
+
+/**
+ * Broadcasts a live update to all friends on this trip.
+ */
+export async function broadcastTripEvent(
+  tripId: string,
+  eventData: Omit<LiveSyncEvent, 'tripId' | 'senderClientId' | 'timestamp'>
+): Promise<void> {
+  const topic = getTripSyncTopic(tripId);
+  const payload: LiveSyncEvent = {
+    ...eventData,
+    tripId,
+    senderClientId: CLIENT_ID,
+    timestamp: new Date().toISOString(),
+  };
+
+  try {
+    await fetch(`https://ntfy.sh/${topic}`, {
+      method: 'POST',
+      headers: {
+        Title: 'Pool Mint Live Sync',
+        Priority: 'high',
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.warn('Failed to broadcast live trip event:', err);
+  }
+}
+
+/**
+ * Subscribes to live real-time updates for a trip via Server-Sent Events (SSE).
+ * Also performs an initial catch-up poll to fetch any updates from the last 12 hours.
+ */
+export function subscribeToTripLive(
+  tripId: string,
+  onEvent: (event: LiveSyncEvent) => void,
+  onConnectionChange?: (connected: boolean) => void
+): () => void {
+  if (!tripId || typeof window === 'undefined') {
+    return () => {};
+  }
+
+  const topic = getTripSyncTopic(tripId);
+  let isClosed = false;
+  let eventSource: EventSource | null = null;
+  const processedMessageIds = new Set<string>();
+
+  // 1. Initial catch-up poll for missed messages (up to 12 hours ago)
+  const catchUpRecentEvents = async () => {
+    try {
+      const res = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=12h`);
+      if (!res.ok) return;
+      const text = await res.text();
+      const lines = text.trim().split('\n');
+
+      for (const line of lines) {
+        if (!line.trim() || isClosed) continue;
+        try {
+          const item = JSON.parse(line);
+          if (item.event === 'message' && item.message) {
+            if (item.id && processedMessageIds.has(item.id)) continue;
+            if (item.id) processedMessageIds.add(item.id);
+
+            const payload: LiveSyncEvent = JSON.parse(item.message);
+            if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
+              onEvent(payload);
+            }
+          }
+        } catch {
+          // ignore corrupted lines
+        }
+      }
+    } catch (err) {
+      console.warn('Live sync catch-up poll error:', err);
+    }
+  };
+
+  catchUpRecentEvents();
+
+  // 2. Connect to real-time Server-Sent Events stream
+  try {
+    eventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
+
+    eventSource.onopen = () => {
+      if (!isClosed && onConnectionChange) {
+        onConnectionChange(true);
+      }
+    };
+
+    eventSource.onmessage = (e) => {
+      if (isClosed) return;
+      try {
+        const item = JSON.parse(e.data);
+        if (item.event === 'message' && item.message) {
+          if (item.id && processedMessageIds.has(item.id)) return;
+          if (item.id) processedMessageIds.add(item.id);
+
+          const payload: LiveSyncEvent = JSON.parse(item.message);
+          if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
+            onEvent(payload);
+          }
+        }
+      } catch (err) {
+        console.warn('Error parsing incoming live sync message:', err);
+      }
+    };
+
+    eventSource.onerror = () => {
+      if (!isClosed && onConnectionChange) {
+        onConnectionChange(false);
+      }
+    };
+  } catch (err) {
+    console.warn('Failed to initialize EventSource for live sync:', err);
+  }
+
+  // Return cleanup function to disconnect
+  return () => {
+    isClosed = true;
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    if (onConnectionChange) {
+      onConnectionChange(false);
+    }
+  };
+}

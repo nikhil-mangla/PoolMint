@@ -40,6 +40,7 @@ interface DashboardViewProps {
   onToggleTripStatus: () => Promise<void>;
   onOpenTripSettings: () => void;
   onOpenInviteModal: () => void;
+  onManualLiveSync?: () => void;
   onRequestDeleteTrip: () => void;
   onSaveTripInline: (updatedTrip: Trip) => Promise<void>;
   onAddMemberInline: (name: string) => Promise<string | null>;
@@ -58,6 +59,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onToggleTripStatus,
   onOpenTripSettings,
   onOpenInviteModal,
+  onManualLiveSync,
   onRequestDeleteTrip,
   onSaveTripInline,
   onAddMemberInline,
@@ -296,6 +298,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       </span>
                     )}
                   </button>
+                  {onManualLiveSync && (
+                    <button
+                      type="button"
+                      onClick={onManualLiveSync}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-blue-500/40 bg-blue-50/80 dark:bg-blue-950/40 hover:bg-blue-100/80 dark:hover:bg-blue-900/50 px-3 py-1.5 text-xs font-semibold text-blue-800 dark:text-blue-200 transition-colors shadow-xs"
+                      title="Sync all expenses live to your friends"
+                    >
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                      <span>Sync Live</span>
+                    </button>
+                  )}
                 </div>
               </>
             )}
