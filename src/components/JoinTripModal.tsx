@@ -105,6 +105,11 @@ export const JoinTripModal: React.FC<JoinTripModalProps> = ({
               <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
                 <Sparkles className="w-3.5 h-3.5" />
                 <span>{isExistingTrip ? 'Trip Update Detected' : 'Trip Invitation'}</span>
+                {trip.pin && (
+                  <span className="ml-1.5 px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 font-mono text-[11px] font-bold">
+                    PIN: {trip.pin}
+                  </span>
+                )}
               </div>
               <h2
                 id="join-trip-modal-title"

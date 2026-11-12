@@ -81,6 +81,7 @@ export interface Trip {
   allowNegativePool: boolean;
   members: TripMember[];
   customCategories: string[];
+  pin?: string;
   closedAt?: string | null;
   updatedAt: string;
   syncStatus: 'SYNCED' | 'PENDING';

@@ -19,6 +19,7 @@ import {
   Check,
   X,
   Trash2,
+  KeyRound,
 } from 'lucide-react';
 import { signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
 import { auth, googleAuthProvider } from './lib/firebase';
@@ -57,6 +58,7 @@ import {
 import {
   generateTripShareUrl,
   parseJoinPayloadFromLocation,
+  getOrCreateTripPin,
 } from './utils/shareTrip';
 import { DashboardView } from './components/DashboardView';
 import { PoolView } from './components/PoolView';
@@ -68,6 +70,7 @@ import { QuickActionModal } from './components/QuickActionModal';
 import { EditTransactionModal } from './components/EditTransactionModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { JoinTripModal } from './components/JoinTripModal';
+import { JoinWithPinModal } from './components/JoinWithPinModal';
 
 type NavTab = 'HOME' | 'POOL' | 'TRANSFER' | 'EXPENSES' | 'MORE';
 
@@ -144,6 +147,8 @@ export default function App() {
   const [statusToast, setStatusToast] = useState<{ message: string; type: 'SUCCESS' | 'INFO' } | null>(null);
   const [deleteTripConfirmOpen, setDeleteTripConfirmOpen] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  const [copiedPin, setCopiedPin] = useState<boolean>(false);
+  const [joinWithPinModalOpen, setJoinWithPinModalOpen] = useState<boolean>(false);
 
   // Auto-dismiss status toast after 4 seconds
   useEffect(() => {
@@ -442,19 +447,24 @@ export default function App() {
   }, [activeTrip, transactions]);
 
   // Generate live compressed share URL whenever invite modal opens or active trip changes
+  const activeTripPin = useMemo(
+    () => (activeTrip ? getOrCreateTripPin(activeTrip) : '4821'),
+    [activeTrip]
+  );
+
   useEffect(() => {
     if (inviteModalOpen && activeTrip) {
       setIsGeneratingShareUrl(true);
       generateTripShareUrl(activeTrip, transactions)
-        .then((url) => setShareUrl(url))
+        .then((res) => setShareUrl(res.url))
         .catch((err) => {
           console.error('Failed to generate share URL:', err);
           const origin = typeof window !== 'undefined' ? window.location.origin : 'https://poolmint.app';
-          setShareUrl(`${origin}/?trip=${encodeURIComponent(activeTrip.id)}`);
+          setShareUrl(`${origin}/?trip=${encodeURIComponent(activeTrip.id)}&pin=${activeTripPin}`);
         })
         .finally(() => setIsGeneratingShareUrl(false));
     }
-  }, [inviteModalOpen, activeTrip, transactions]);
+  }, [inviteModalOpen, activeTrip, transactions, activeTripPin]);
 
   const appendTransaction = async (tx: Transaction, auditNote: string) => {
     const actorName =
@@ -824,6 +834,20 @@ export default function App() {
     });
   };
 
+  const handleJoinLocalTripByPin = (pinToFind: string): boolean => {
+    const matched = trips.find((t) => t.pin === pinToFind || getOrCreateTripPin(t) === pinToFind);
+    if (matched) {
+      setActiveTripId(matched.id);
+      setActiveViewerMemberId(matched.treasurerMemberId || matched.members[0]?.id || 'mem-1');
+      setStatusToast({
+        message: `Switched to "${matched.name}" (PIN: ${pinToFind})!`,
+        type: 'SUCCESS',
+      });
+      return true;
+    }
+    return false;
+  };
+
   const handleAddMemberInline = async (memberName: string): Promise<string | null> => {
     if (!activeTrip) return null;
     const trimmed = memberName.trim();
@@ -1058,6 +1082,15 @@ export default function App() {
         {/* Zone 3: Primary Action */}
         <div className="flex items-center gap-2 shrink-0">
           <PWAInstallButton />
+          <button
+            type="button"
+            onClick={() => setJoinWithPinModalOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+            title="Join a trip using a 4-digit PIN or invite link"
+          >
+            <KeyRound className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+            <span>Join with PIN</span>
+          </button>
           <button
             type="button"
             onClick={() =>
@@ -1511,7 +1544,7 @@ export default function App() {
                   Share “{activeTrip.name}” with friends
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                  Share this link with your friends. When they open it, this trip, all members, and current expenses will load on their phone instantly!
+                  Share this 4-digit PIN and invite link with your friends. When they open it, your trip, members, and current expenses will load on their phone instantly!
                 </p>
               </div>
               <button
@@ -1521,6 +1554,51 @@ export default function App() {
               >
                 <X className="w-5 h-5" />
               </button>
+            </div>
+
+            {/* 🔑 TRIP ACCESS PIN CARD */}
+            <div className="rounded-2xl border-2 border-emerald-500/50 bg-emerald-50/70 dark:bg-emerald-950/40 p-4 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-xl bg-emerald-600 text-white flex items-center justify-center shadow-xs">
+                    <KeyRound className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-1.5">
+                      <span>Trip Access PIN</span>
+                      <span className="px-1.5 py-0.2 rounded bg-emerald-600 text-white text-[10px] font-semibold">Active</span>
+                    </h3>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Share this 4-digit PIN with your friends
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(activeTripPin);
+                    setCopiedPin(true);
+                    setTimeout(() => setCopiedPin(false), 2000);
+                    setStatusToast({ message: `🔑 PIN ${activeTripPin} copied!`, type: 'SUCCESS' });
+                  }}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-xs transition-colors"
+                >
+                  {copiedPin ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedPin ? 'Copied' : 'Copy PIN'}</span>
+                </button>
+              </div>
+
+              {/* 4 Digit Boxes */}
+              <div className="flex items-center justify-center gap-3 py-1.5">
+                {activeTripPin.split('').map((digit, idx) => (
+                  <div
+                    key={idx}
+                    className="w-12 h-14 rounded-2xl bg-white dark:bg-slate-900 border-2 border-emerald-500/60 shadow-md flex items-center justify-center text-2xl font-black font-mono text-emerald-700 dark:text-emerald-300 ring-2 ring-emerald-500/10"
+                  >
+                    {digit}
+                  </div>
+                ))}
+              </div>
             </div>
 
             {/* Link Box */}
@@ -1579,12 +1657,12 @@ export default function App() {
                 onClick={async () => {
                   if (!shareUrl) return;
                   const memberList = activeTrip.members.map((m) => m.name).join(', ');
-                  const inviteText = `🧳 Join our trip "${activeTrip.name}" (${activeTrip.destination})!\n👥 Members: ${memberList}\n💰 Common Pool Available: ${formatCurrency(report.totalPoolBalancePaise, activeTrip.currency)}\n🔗 Link: ${shareUrl}`;
+                  const inviteText = `🧳 Join our trip "${activeTrip.name}" (${activeTrip.destination})!\n🔑 Access PIN: ${activeTripPin}\n👥 Members: ${memberList}\n💰 Common Pool Available: ${formatCurrency(report.totalPoolBalancePaise, activeTrip.currency)}\n🔗 Link: ${shareUrl}`;
 
                   if (typeof navigator !== 'undefined' && navigator.share) {
                     try {
                       await navigator.share({
-                        title: `Join ${activeTrip.name} on Pool Mint`,
+                        title: `Join ${activeTrip.name} (PIN: ${activeTripPin}) on Pool Mint`,
                         text: inviteText,
                         url: shareUrl,
                       });
@@ -1598,7 +1676,7 @@ export default function App() {
                   navigator.clipboard?.writeText(inviteText);
                   setCopiedLink(true);
                   setTimeout(() => setCopiedLink(false), 2500);
-                  setStatusToast({ message: '💬 Invite message copied to clipboard!', type: 'SUCCESS' });
+                  setStatusToast({ message: `💬 Invite with PIN ${activeTripPin} copied!`, type: 'SUCCESS' });
                 }}
                 className="rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 py-2.5 px-3 text-xs font-semibold text-white flex items-center justify-center gap-1.5 shadow-md transition-colors"
               >
@@ -1615,6 +1693,19 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* JOIN WITH PIN / LINK MODAL */}
+      {joinWithPinModalOpen && (
+        <JoinWithPinModal
+          onJoinFromPayload={(payload) => {
+            setPendingJoinPayload(payload);
+            const existing = trips.some((t) => t.id === payload.trip.id);
+            setIsExistingTripJoin(existing);
+          }}
+          onJoinLocalTripByPin={handleJoinLocalTripByPin}
+          onClose={() => setJoinWithPinModalOpen(false)}
+        />
       )}
     </div>
   );

@@ -18,6 +18,7 @@ interface SerializedTripShare {
     allowNegativePool: boolean;
     members: Trip['members'];
     customCategories?: string[];
+    pin?: string;
     closedAt?: string | null;
     updatedAt: string;
   };
@@ -45,6 +46,30 @@ interface SerializedTripShare {
     createdByMemberId: string;
     updatedAt: string;
   }>;
+}
+
+/**
+ * Generates a stable or random 4-digit PIN for a trip.
+ */
+export function getOrCreateTripPin(trip: Trip): string {
+  if (trip.pin && /^\d{4}$/.test(trip.pin)) {
+    return trip.pin;
+  }
+  // Deterministic 4-digit PIN based on trip id hash
+  let hash = 0;
+  for (let i = 0; i < trip.id.length; i++) {
+    hash = (hash << 5) - hash + trip.id.charCodeAt(i);
+    hash |= 0;
+  }
+  const pinNum = (Math.abs(hash) % 9000) + 1000;
+  return pinNum.toString();
+}
+
+/**
+ * Generates a completely new random 4-digit PIN.
+ */
+export function generateRandomPin(): string {
+  return Math.floor(1000 + Math.random() * 9000).toString();
 }
 
 /**
@@ -86,6 +111,7 @@ export async function encodeTripSharePayload(
   transactions: Transaction[]
 ): Promise<string> {
   const tripTransactions = transactions.filter((tx) => tx.tripId === trip.id);
+  const pin = getOrCreateTripPin(trip);
 
   const payload: SerializedTripShare = {
     t: {
@@ -102,6 +128,7 @@ export async function encodeTripSharePayload(
       allowNegativePool: trip.allowNegativePool,
       members: trip.members,
       customCategories: trip.customCategories,
+      pin,
       closedAt: trip.closedAt,
       updatedAt: trip.updatedAt,
     },
@@ -147,7 +174,7 @@ export async function encodeTripSharePayload(
     }
   }
 
-  // Fallback for older environments without CompressionStream
+  // Fallback for environments without CompressionStream
   return 'raw.' + encodeURIComponent(jsonString);
 }
 
@@ -160,10 +187,16 @@ export async function decodeTripSharePayload(
   if (!rawPayload) return null;
 
   try {
+    let cleanPayload = rawPayload.trim();
+    // In case payload was URL encoded
+    if (cleanPayload.includes('%')) {
+      cleanPayload = decodeURIComponent(cleanPayload);
+    }
+
     let jsonString = '';
 
-    if (rawPayload.startsWith('gz.')) {
-      const b64 = rawPayload.slice(3);
+    if (cleanPayload.startsWith('gz.')) {
+      const b64 = cleanPayload.slice(3);
       const bytes = base64UrlToUint8(b64);
       if (typeof DecompressionStream !== 'undefined') {
         const ds = new DecompressionStream('gzip');
@@ -175,14 +208,14 @@ export async function decodeTripSharePayload(
       } else {
         throw new Error('DecompressionStream is not supported in this browser.');
       }
-    } else if (rawPayload.startsWith('raw.')) {
-      jsonString = decodeURIComponent(rawPayload.slice(4));
+    } else if (cleanPayload.startsWith('raw.')) {
+      jsonString = decodeURIComponent(cleanPayload.slice(4));
     } else {
       // Try direct base64url or plain JSON
       try {
-        jsonString = decodeURIComponent(rawPayload);
+        jsonString = decodeURIComponent(cleanPayload);
       } catch {
-        jsonString = rawPayload;
+        jsonString = cleanPayload;
       }
     }
 
@@ -194,6 +227,7 @@ export async function decodeTripSharePayload(
 
     const trip: Trip = {
       ...parsed.t,
+      pin: parsed.t.pin || getOrCreateTripPin(parsed.t as Trip),
       customCategories: parsed.t.customCategories || [],
       syncStatus: 'SYNCED',
       lifecycleStatus: 'SYNCED',
@@ -216,43 +250,68 @@ export async function decodeTripSharePayload(
 }
 
 /**
- * Generates the full share URL for inviting friends.
+ * Generates the full share URL and PIN for inviting friends.
+ * Places data in query parameter ?d= so WhatsApp / Telegram / SMS never strip it!
  */
 export async function generateTripShareUrl(
   trip: Trip,
   transactions: Transaction[]
-): Promise<string> {
+): Promise<{ url: string; pin: string }> {
   const origin = typeof window !== 'undefined' ? window.location.origin : 'https://poolmint.app';
-  const encodedPayload = await encodeTripSharePayload(trip, transactions);
-  return `${origin}/?trip=${encodeURIComponent(trip.id)}#join=${encodedPayload}`;
+  const pin = getOrCreateTripPin(trip);
+  const tripWithPin: Trip = { ...trip, pin };
+  const encodedPayload = await encodeTripSharePayload(tripWithPin, transactions);
+
+  // IMPORTANT: Query parameters (?pin=...&d=...) are NEVER stripped by WhatsApp or chat apps!
+  const url = `${origin}/?trip=${encodeURIComponent(trip.id)}&pin=${pin}&d=${encodeURIComponent(encodedPayload)}`;
+  return { url, pin };
 }
 
 /**
- * Checks current location for a join payload in the hash or query string.
+ * Checks current location for a join payload in the query string (?d=) or hash (#join=).
  */
 export async function parseJoinPayloadFromLocation(): Promise<{
   trip: Trip;
   transactions: Transaction[];
+  pin?: string;
 } | null> {
   if (typeof window === 'undefined') return null;
 
-  // 1. Check window.location.hash for #join=... or #data=...
-  const hash = window.location.hash;
-  if (hash) {
-    const joinMatch = hash.match(/[#&](join|data)=([^&]+)/);
-    if (joinMatch && joinMatch[2]) {
-      const decoded = await decodeTripSharePayload(joinMatch[2]);
-      if (decoded) return decoded;
-    }
-  }
-
-  // 2. Check window.location.search for ?join=... (in case hash was transformed to query param)
+  // 1. Primary: Check window.location.search for ?d=... (Query parameters are preserved by all chat apps!)
   const search = window.location.search;
   if (search) {
     const params = new URLSearchParams(search);
+    const dParam = params.get('d');
+    const pinParam = params.get('pin');
+
+    if (dParam) {
+      const decoded = await decodeTripSharePayload(dParam);
+      if (decoded) {
+        return {
+          ...decoded,
+          pin: pinParam || decoded.trip.pin,
+        };
+      }
+    }
+
     const joinParam = params.get('join');
     if (joinParam) {
       const decoded = await decodeTripSharePayload(joinParam);
+      if (decoded) {
+        return {
+          ...decoded,
+          pin: pinParam || decoded.trip.pin,
+        };
+      }
+    }
+  }
+
+  // 2. Secondary fallback: Check window.location.hash for #join=... or #d=...
+  const hash = window.location.hash;
+  if (hash) {
+    const joinMatch = hash.match(/[#&](join|data|d)=([^&]+)/);
+    if (joinMatch && joinMatch[2]) {
+      const decoded = await decodeTripSharePayload(joinMatch[2]);
       if (decoded) return decoded;
     }
   }
