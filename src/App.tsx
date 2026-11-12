@@ -42,6 +42,7 @@ import {
   formatCurrency,
 } from './utils/accounting';
 import {
+  localDb,
   initializeLocalDatabase,
   saveTripLocal,
   deleteTripLocal,
@@ -100,7 +101,13 @@ async function sha256Hex(text: string): Promise<string> {
 
 export default function App() {
   const [trips, setTrips] = useState<Trip[]>([]);
-  const [activeTripId, setActiveTripId] = useState<string>('');
+  const [activeTripId, setActiveTripId] = useState<string>(() => {
+    try {
+      return localStorage.getItem('pm_active_trip_id') || '';
+    } catch {
+      return '';
+    }
+  });
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
@@ -204,34 +211,39 @@ export default function App() {
             setActiveTripId(data.trips[0].id);
           }
         } else {
-          // Check for URL query param ?trip=<id>
+          // Check for URL query param ?trip=<id> or restore previously active trip
           if (typeof window !== 'undefined') {
             const urlParams = new URLSearchParams(window.location.search);
             const tripParam = urlParams.get('trip');
-            if (tripParam && data.trips.some((t) => t.id === tripParam)) {
-              setActiveTripId(tripParam);
-              const matched = data.trips.find((t) => t.id === tripParam);
-              if (matched) {
-                setActiveViewerMemberId(matched.treasurerMemberId || matched.members[0]?.id || 'mem-1');
-              }
-            } else if (tripParam && !data.trips.some((t) => t.id === tripParam)) {
-              setStatusToast({
-                message: '⚠️ Trip not found on this device. Ask your friend for an updated invite link.',
-                type: 'INFO',
-              });
-              if (data.trips.length > 0) {
-                setActiveTripId(data.trips[0].id);
-                setActiveViewerMemberId(data.trips[0].treasurerMemberId || data.trips[0].members[0]?.id || 'mem-1');
-              }
-            } else if (data.trips.length > 0) {
-              setActiveTripId(data.trips[0].id);
-              setActiveViewerMemberId(data.trips[0].treasurerMemberId || data.trips[0].members[0]?.id || 'mem-1');
+            const savedTripId = localStorage.getItem('pm_active_trip_id');
+
+            const targetTrip =
+              (tripParam && data.trips.find((t) => t.id === tripParam)) ||
+              (savedTripId && data.trips.find((t) => t.id === savedTripId)) ||
+              data.trips[0];
+
+            if (targetTrip) {
+              setActiveTripId(targetTrip.id);
+              setActiveViewerMemberId(
+                targetTrip.treasurerMemberId || targetTrip.members[0]?.id || 'mem-1'
+              );
             }
           }
         }
       })
       .finally(() => setLoading(false));
   }, []);
+
+  // Persist activeTripId so refreshing the page preserves the selected trip
+  useEffect(() => {
+    if (activeTripId) {
+      try {
+        localStorage.setItem('pm_active_trip_id', activeTripId);
+      } catch {
+        // ignore
+      }
+    }
+  }, [activeTripId]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
@@ -243,8 +255,9 @@ export default function App() {
   const pendingSyncCount = useMemo(() => {
     const tCount = trips.filter((t) => t.syncStatus === 'PENDING').length;
     const txCount = transactions.filter((tx) => tx.syncStatus === 'PENDING').length;
-    return tCount + txCount;
-  }, [trips, transactions]);
+    const auditCount = auditLogs.filter((l) => l.syncStatus === 'PENDING').length;
+    return tCount + txCount + auditCount;
+  }, [trips, transactions, auditLogs]);
 
   // Phase 5 Synchronization Indicator State & Color
   const { syncStateLabel, syncIndicatorColor } = useMemo((): {
@@ -289,6 +302,8 @@ export default function App() {
     try {
       await updateSyncLifecycleStatusLocal('SYNCING');
 
+      let broadcastSuccess = true;
+
       // 1. Live broadcast every pending transaction so friends listening via SSE update instantly
       const pendingTxs = transactions.filter((tx) => tx.syncStatus === 'PENDING');
       for (const tx of pendingTxs) {
@@ -297,10 +312,11 @@ export default function App() {
           syncStatus: 'SYNCED',
           lifecycleStatus: 'SYNCED',
         };
-        await broadcastTripEvent(tx.tripId, {
+        const ok = await broadcastTripEvent(tx.tripId, {
           type: 'TRANSACTION_SAVED',
           tx: cleanTx,
         });
+        if (!ok) broadcastSuccess = false;
       }
 
       // 2. Broadcast pending deletions from audit logs if any
@@ -308,10 +324,11 @@ export default function App() {
         (l) => l.syncStatus === 'PENDING' && l.action === 'REVERSED' && l.transactionId
       );
       for (const l of pendingDelLogs) {
-        await broadcastTripEvent(l.tripId, {
+        const ok = await broadcastTripEvent(l.tripId, {
           type: 'TRANSACTION_DELETED',
           txId: l.transactionId!,
         });
+        if (!ok) broadcastSuccess = false;
       }
 
       // 3. Broadcast full SYNC_SNAPSHOT of active trip so all friends get the complete synchronized ledger
@@ -324,7 +341,7 @@ export default function App() {
             lifecycleStatus: 'SYNCED' as const,
           }));
 
-        await broadcastTripEvent(activeTrip.id, {
+        const ok = await broadcastTripEvent(activeTrip.id, {
           type: 'SYNC_SNAPSHOT',
           trip: {
             ...activeTrip,
@@ -333,6 +350,11 @@ export default function App() {
           },
           transactions: tripTxs,
         });
+        if (!ok) broadcastSuccess = false;
+      }
+
+      if (!broadcastSuccess && pendingTxs.length > 0) {
+        throw new Error('Network unreachable. Offline changes remain pending.');
       }
 
       // 4. Mark all local Dexie IndexedDB records as SYNCED
@@ -546,25 +568,56 @@ export default function App() {
       async (event: LiveSyncEvent) => {
         if (event.type === 'TRANSACTION_SAVED' && event.tx) {
           const incomingTx = event.tx;
-          await saveTransactionLocal(incomingTx);
+          let shouldToast = false;
+
           setTransactions((prev) => {
             const idx = prev.findIndex((item) => item.id === incomingTx.id);
             if (idx >= 0) {
+              const current = prev[idx];
+              // 1. Never overwrite local pending edits
+              if (current.syncStatus === 'PENDING') {
+                return prev;
+              }
+              // 2. Never overwrite if local record is newer
+              if (
+                current.updatedAt &&
+                incomingTx.updatedAt &&
+                incomingTx.updatedAt < current.updatedAt
+              ) {
+                return prev;
+              }
+              // 3. Skip if already identical
+              if (
+                current.amountPaise === incomingTx.amountPaise &&
+                current.title === incomingTx.title &&
+                current.isReversed === incomingTx.isReversed &&
+                current.notes === incomingTx.notes &&
+                current.fromMemberId === incomingTx.fromMemberId &&
+                current.paidByMemberId === incomingTx.paidByMemberId
+              ) {
+                return prev;
+              }
+              shouldToast = true;
               const copy = [...prev];
               copy[idx] = incomingTx;
+              saveTransactionLocal(incomingTx);
               return copy;
             }
+            shouldToast = true;
+            saveTransactionLocal(incomingTx);
             return [incomingTx, ...prev];
           });
 
-          const isContrib = incomingTx.type === 'CONTRIBUTION';
-          const title = isContrib
-            ? `Pool deposit ${formatCurrency(incomingTx.amountPaise, incomingTx.currency)}`
-            : `Expense "${incomingTx.title}" (${formatCurrency(incomingTx.amountPaise, incomingTx.currency)})`;
-          setStatusToast({
-            message: `⚡ Live Update: ${title} synced!`,
-            type: 'SUCCESS',
-          });
+          if (shouldToast) {
+            const isContrib = incomingTx.type === 'CONTRIBUTION';
+            const title = isContrib
+              ? `Pool deposit ${formatCurrency(incomingTx.amountPaise, incomingTx.currency)}`
+              : `Expense "${incomingTx.title}" (${formatCurrency(incomingTx.amountPaise, incomingTx.currency)})`;
+            setStatusToast({
+              message: `⚡ Live Update: ${title} synced!`,
+              type: 'SUCCESS',
+            });
+          }
         } else if (event.type === 'TRANSACTION_DELETED' && event.txId) {
           await deleteTransactionLocal(event.txId);
           setTransactions((prev) => prev.filter((item) => item.id !== event.txId));
@@ -604,16 +657,6 @@ export default function App() {
       }
     );
 
-    // Initial broadcast of snapshot so any listening friend gets our current data (e.g. ₹4000 contribution!)
-    const currentTripTxs = transactions.filter((tx) => tx.tripId === activeTrip.id);
-    if (currentTripTxs.length > 0) {
-      broadcastTripEvent(activeTrip.id, {
-        type: 'SYNC_SNAPSHOT',
-        trip: activeTrip,
-        transactions: currentTripTxs,
-      });
-    }
-
     return () => unsubscribe();
   }, [activeTrip?.id]);
 
@@ -649,12 +692,30 @@ export default function App() {
     setAuditLogs((prev) => [log, ...prev]);
     setSyncError(null);
 
-    // Live Broadcast to all friends connected to this trip
-    if (activeTrip?.id) {
-      broadcastTripEvent(activeTrip.id, {
+    // Live Broadcast to all friends connected to this trip IF online
+    if (isEffectiveOnline && activeTrip?.id) {
+      const ok = await broadcastTripEvent(activeTrip.id, {
         type: 'TRANSACTION_SAVED',
-        tx: preparedTx,
+        tx: {
+          ...preparedTx,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        },
       });
+      if (ok) {
+        await saveTransactionLocal({
+          ...preparedTx,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        });
+        setTransactions((prev) =>
+          prev.map((item) =>
+            item.id === preparedTx.id
+              ? { ...item, syncStatus: 'SYNCED', lifecycleStatus: 'SYNCED' }
+              : item
+          )
+        );
+      }
     }
   };
 
@@ -866,15 +927,34 @@ export default function App() {
     ]);
     setAuditLogs((prev) => [auditLog, ...prev]);
 
-    if (activeTrip?.id) {
-      broadcastTripEvent(activeTrip.id, {
+    if (isEffectiveOnline && activeTrip?.id) {
+      const ok1 = await broadcastTripEvent(activeTrip.id, {
         type: 'TRANSACTION_SAVED',
-        tx: updatedOriginal,
+        tx: { ...updatedOriginal, syncStatus: 'SYNCED', lifecycleStatus: 'SYNCED' },
       });
-      broadcastTripEvent(activeTrip.id, {
+      const ok2 = await broadcastTripEvent(activeTrip.id, {
         type: 'TRANSACTION_SAVED',
-        tx: reversalEntry,
+        tx: { ...reversalEntry, syncStatus: 'SYNCED', lifecycleStatus: 'SYNCED' },
       });
+      if (ok1 && ok2) {
+        await saveTransactionLocal({
+          ...updatedOriginal,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        });
+        await saveTransactionLocal({
+          ...reversalEntry,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        });
+        setTransactions((prev) =>
+          prev.map((item) => {
+            if (item.id === updatedOriginal.id) return { ...updatedOriginal, syncStatus: 'SYNCED' };
+            if (item.id === reversalEntry.id) return { ...reversalEntry, syncStatus: 'SYNCED' };
+            return item;
+          })
+        );
+      }
     }
   };
 
@@ -882,10 +962,18 @@ export default function App() {
     if (!activeTrip) return;
     const now = new Date().toISOString();
     const existing = transactions.find((t) => t.id === updatedTx.id);
+
+    const preparedTx: Transaction = {
+      ...updatedTx,
+      syncStatus: 'PENDING',
+      lifecycleStatus: 'PENDING_SYNC',
+      updatedAt: now,
+    };
+
     const log: AuditLog = {
       id: generateUniqueId('audit-edit'),
-      tripId: updatedTx.tripId,
-      transactionId: updatedTx.id,
+      tripId: preparedTx.tripId,
+      transactionId: preparedTx.id,
       action: 'EDITED',
       actorName: `${currentRole}`,
       timestamp: now,
@@ -897,25 +985,43 @@ export default function App() {
           })
         : null,
       newValueJson: JSON.stringify({
-        title: updatedTx.title,
-        amountPaise: updatedTx.amountPaise,
-        paymentSource: updatedTx.paymentSource,
+        title: preparedTx.title,
+        amountPaise: preparedTx.amountPaise,
+        paymentSource: preparedTx.paymentSource,
       }),
-      notes: `Edited transaction "${updatedTx.title}"`,
+      notes: `Edited transaction "${preparedTx.title}"`,
       syncStatus: 'PENDING',
     };
 
-    await saveTransactionLocal(updatedTx, log);
+    await saveTransactionLocal(preparedTx, log);
     setTransactions((prev) =>
-      prev.map((item) => (item.id === updatedTx.id ? updatedTx : item))
+      prev.map((item) => (item.id === preparedTx.id ? preparedTx : item))
     );
     setAuditLogs((prev) => [log, ...prev]);
 
-    if (activeTrip?.id) {
-      broadcastTripEvent(activeTrip.id, {
+    if (isEffectiveOnline && activeTrip?.id) {
+      const ok = await broadcastTripEvent(activeTrip.id, {
         type: 'TRANSACTION_SAVED',
-        tx: updatedTx,
+        tx: {
+          ...preparedTx,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        },
       });
+      if (ok) {
+        await saveTransactionLocal({
+          ...preparedTx,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        });
+        setTransactions((prev) =>
+          prev.map((item) =>
+            item.id === preparedTx.id
+              ? { ...item, syncStatus: 'SYNCED', lifecycleStatus: 'SYNCED' }
+              : item
+          )
+        );
+      }
     }
   };
 
@@ -940,11 +1046,17 @@ export default function App() {
     setTransactions((prev) => prev.filter((item) => item.id !== tx.id));
     setAuditLogs((prev) => [log, ...prev]);
 
-    if (activeTrip?.id) {
-      broadcastTripEvent(activeTrip.id, {
+    if (isEffectiveOnline && activeTrip?.id) {
+      const ok = await broadcastTripEvent(activeTrip.id, {
         type: 'TRANSACTION_DELETED',
         txId: tx.id,
       });
+      if (ok) {
+        await localDb.AuditLogs.update(log.id, { syncStatus: 'SYNCED' });
+        setAuditLogs((prev) =>
+          prev.map((item) => (item.id === log.id ? { ...item, syncStatus: 'SYNCED' } : item))
+        );
+      }
     }
   };
 

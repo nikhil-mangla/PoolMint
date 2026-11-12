@@ -1,10 +1,22 @@
 import type { Trip, Transaction } from '../types/treasury.ts';
 
-// Unique client identifier for this tab/session to avoid echoing our own events
-export const CLIENT_ID =
-  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : 'cli_' + Math.random().toString(36).slice(2, 10);
+// Persistent unique client identifier for this device/browser to avoid echoing our own events
+export const CLIENT_ID = (() => {
+  if (typeof window === 'undefined') return 'server';
+  try {
+    let id = localStorage.getItem('pm_client_id');
+    if (!id) {
+      id =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : 'cli_' + Math.random().toString(36).slice(2, 10);
+      localStorage.setItem('pm_client_id', id);
+    }
+    return id;
+  } catch {
+    return 'cli_' + Math.random().toString(36).slice(2, 10);
+  }
+})();
 
 export type LiveSyncEventType =
   | 'TRANSACTION_SAVED'
@@ -34,21 +46,23 @@ export function getTripSyncTopic(tripId: string): string {
 
 /**
  * Broadcasts a live update to all friends on this trip.
+ * Returns true if the HTTP broadcast succeeded, false if offline/unreachable.
  */
 export async function broadcastTripEvent(
   tripId: string,
   eventData: Omit<LiveSyncEvent, 'tripId' | 'senderClientId' | 'timestamp'>
-): Promise<void> {
+): Promise<boolean> {
   const topic = getTripSyncTopic(tripId);
+  const nowIso = new Date().toISOString();
   const payload: LiveSyncEvent = {
     ...eventData,
     tripId,
     senderClientId: CLIENT_ID,
-    timestamp: new Date().toISOString(),
+    timestamp: nowIso,
   };
 
   try {
-    await fetch(`https://ntfy.sh/${topic}`, {
+    const res = await fetch(`https://ntfy.sh/${topic}`, {
       method: 'POST',
       headers: {
         Title: 'Pool Mint Live Sync',
@@ -56,14 +70,24 @@ export async function broadcastTripEvent(
       },
       body: JSON.stringify(payload),
     });
+    if (res.ok) {
+      try {
+        localStorage.setItem(`pm_last_event_${tripId}`, nowIso);
+      } catch {
+        // ignore
+      }
+      return true;
+    }
+    return false;
   } catch (err) {
     console.warn('Failed to broadcast live trip event:', err);
+    return false;
   }
 }
 
 /**
  * Subscribes to live real-time updates for a trip via Server-Sent Events (SSE).
- * Also performs an initial catch-up poll to fetch any updates from the last 12 hours.
+ * Performs an initial catch-up poll for missed messages only since last sync timestamp.
  */
 export function subscribeToTripLive(
   tripId: string,
@@ -79,10 +103,24 @@ export function subscribeToTripLive(
   let eventSource: EventSource | null = null;
   const processedMessageIds = new Set<string>();
 
-  // 1. Initial catch-up poll for missed messages (up to 12 hours ago)
+  // 1. Catch-up poll for missed messages only since the last processed event
   const catchUpRecentEvents = async () => {
     try {
-      const res = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=12h`);
+      let sinceParam = '5m';
+      try {
+        const storedTs = localStorage.getItem(`pm_last_event_${tripId}`);
+        if (storedTs) {
+          const storedUnix = Math.floor(new Date(storedTs).getTime() / 1000);
+          const nowUnix = Math.floor(Date.now() / 1000);
+          if (nowUnix - storedUnix < 86400 && nowUnix >= storedUnix) {
+            sinceParam = storedUnix.toString();
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      const res = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=${sinceParam}`);
       if (!res.ok) return;
       const text = await res.text();
       const lines = text.trim().split('\n');
@@ -98,6 +136,13 @@ export function subscribeToTripLive(
             const payload: LiveSyncEvent = JSON.parse(item.message);
             if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
               onEvent(payload);
+              if (payload.timestamp) {
+                try {
+                  localStorage.setItem(`pm_last_event_${tripId}`, payload.timestamp);
+                } catch {
+                  // ignore
+                }
+              }
             }
           }
         } catch {
@@ -143,6 +188,13 @@ export function subscribeToTripLive(
             const payload: LiveSyncEvent = JSON.parse(item.message);
             if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
               onEvent(payload);
+              if (payload.timestamp) {
+                try {
+                  localStorage.setItem(`pm_last_event_${tripId}`, payload.timestamp);
+                } catch {
+                  // ignore
+                }
+              }
             }
           }
         } catch (err) {
