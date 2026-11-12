@@ -1,16 +1,16 @@
 import type { Trip, Transaction } from '../types/treasury.ts';
 
-// Persistent unique client identifier for this device/browser to avoid echoing our own events
+// Unique client identifier for this tab/session to avoid echoing our own events (isolated per tab)
 export const CLIENT_ID = (() => {
   if (typeof window === 'undefined') return 'server';
   try {
-    let id = localStorage.getItem('pm_client_id');
+    let id = sessionStorage.getItem('pm_client_id');
     if (!id) {
       id =
         typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
           ? crypto.randomUUID()
           : 'cli_' + Math.random().toString(36).slice(2, 10);
-      localStorage.setItem('pm_client_id', id);
+      sessionStorage.setItem('pm_client_id', id);
     }
     return id;
   } catch {
@@ -34,6 +34,30 @@ export interface LiveSyncEvent {
   txId?: string;
   trip?: Trip;
   transactions?: Transaction[];
+}
+
+/**
+ * Parses incoming ntfy event item, resolving either inline JSON message or file attachment URL
+ */
+async function parseEventItem(item: any): Promise<LiveSyncEvent | null> {
+  if (item.attachment?.url) {
+    try {
+      const res = await fetch(item.attachment.url);
+      if (res.ok) {
+        return (await res.json()) as LiveSyncEvent;
+      }
+    } catch (err) {
+      console.warn('Failed to fetch event attachment:', err);
+    }
+  }
+  if (item.message) {
+    try {
+      return JSON.parse(item.message) as LiveSyncEvent;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 /**
@@ -72,7 +96,7 @@ export async function broadcastTripEvent(
     });
     if (res.ok) {
       try {
-        localStorage.setItem(`pm_last_event_${tripId}`, nowIso);
+        sessionStorage.setItem(`pm_last_event_${tripId}`, nowIso);
       } catch {
         // ignore
       }
@@ -106,14 +130,15 @@ export function subscribeToTripLive(
   // 1. Catch-up poll for missed messages only since the last processed event
   const catchUpRecentEvents = async () => {
     try {
-      let sinceParam = '5m';
+      let sinceParam = '10m';
       try {
-        const storedTs = localStorage.getItem(`pm_last_event_${tripId}`);
+        const storedTs = sessionStorage.getItem(`pm_last_event_${tripId}`);
         if (storedTs) {
           const storedUnix = Math.floor(new Date(storedTs).getTime() / 1000);
           const nowUnix = Math.floor(Date.now() / 1000);
           if (nowUnix - storedUnix < 86400 && nowUnix >= storedUnix) {
-            sinceParam = storedUnix.toString();
+            // Subtract 30s buffer so boundary messages are never missed
+            sinceParam = Math.max(0, storedUnix - 30).toString();
           }
         }
       } catch {
@@ -129,16 +154,16 @@ export function subscribeToTripLive(
         if (!line.trim() || isClosed) continue;
         try {
           const item = JSON.parse(line);
-          if (item.event === 'message' && item.message) {
+          if (item.event === 'message') {
             if (item.id && processedMessageIds.has(item.id)) continue;
             if (item.id) processedMessageIds.add(item.id);
 
-            const payload: LiveSyncEvent = JSON.parse(item.message);
+            const payload = await parseEventItem(item);
             if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
               onEvent(payload);
               if (payload.timestamp) {
                 try {
-                  localStorage.setItem(`pm_last_event_${tripId}`, payload.timestamp);
+                  sessionStorage.setItem(`pm_last_event_${tripId}`, payload.timestamp);
                 } catch {
                   // ignore
                 }
@@ -177,20 +202,20 @@ export function subscribeToTripLive(
         }
       };
 
-      eventSource.onmessage = (e) => {
+      eventSource.onmessage = async (e) => {
         if (isClosed) return;
         try {
           const item = JSON.parse(e.data);
-          if (item.event === 'message' && item.message) {
+          if (item.event === 'message') {
             if (item.id && processedMessageIds.has(item.id)) return;
             if (item.id) processedMessageIds.add(item.id);
 
-            const payload: LiveSyncEvent = JSON.parse(item.message);
+            const payload = await parseEventItem(item);
             if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
               onEvent(payload);
               if (payload.timestamp) {
                 try {
-                  localStorage.setItem(`pm_last_event_${tripId}`, payload.timestamp);
+                  sessionStorage.setItem(`pm_last_event_${tripId}`, payload.timestamp);
                 } catch {
                   // ignore
                 }

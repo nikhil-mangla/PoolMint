@@ -304,13 +304,17 @@ export default function App() {
 
       let broadcastSuccess = true;
 
-      // 1. Live broadcast every pending transaction so friends listening via SSE update instantly
-      const pendingTxs = transactions.filter((tx) => tx.syncStatus === 'PENDING');
+      // 1. Live broadcast every pending transaction from local IndexedDB
+      const allDbTxs = await localDb.TransactionLedger.toArray();
+      const allDbLogs = await localDb.AuditLogs.toArray();
+      const pendingTxs = allDbTxs.filter((tx) => tx.syncStatus === 'PENDING');
+
       for (const tx of pendingTxs) {
         const cleanTx: Transaction = {
           ...tx,
           syncStatus: 'SYNCED',
           lifecycleStatus: 'SYNCED',
+          updatedAt: new Date().toISOString(),
         };
         const ok = await broadcastTripEvent(tx.tripId, {
           type: 'TRANSACTION_SAVED',
@@ -320,7 +324,7 @@ export default function App() {
       }
 
       // 2. Broadcast pending deletions from audit logs if any
-      const pendingDelLogs = auditLogs.filter(
+      const pendingDelLogs = allDbLogs.filter(
         (l) => l.syncStatus === 'PENDING' && l.action === 'REVERSED' && l.transactionId
       );
       for (const l of pendingDelLogs) {
@@ -333,7 +337,7 @@ export default function App() {
 
       // 3. Broadcast full SYNC_SNAPSHOT of active trip so all friends get the complete synchronized ledger
       if (activeTrip?.id) {
-        const tripTxs = transactions
+        const tripTxs = allDbTxs
           .filter((tx) => tx.tripId === activeTrip.id)
           .map((tx) => ({
             ...tx,
@@ -568,56 +572,50 @@ export default function App() {
       async (event: LiveSyncEvent) => {
         if (event.type === 'TRANSACTION_SAVED' && event.tx) {
           const incomingTx = event.tx;
-          let shouldToast = false;
 
+          // Check if local has uncommitted pending edits on this transaction
+          const existingLocal = transactions.find((t) => t.id === incomingTx.id);
+          if (existingLocal && existingLocal.syncStatus === 'PENDING') {
+            return; // Protect uncommitted local offline changes
+          }
+
+          // Cleanly persist to IndexedDB
+          await saveTransactionLocal({
+            ...incomingTx,
+            syncStatus: 'SYNCED',
+            lifecycleStatus: 'SYNCED',
+          });
+
+          // Update React state
           setTransactions((prev) => {
             const idx = prev.findIndex((item) => item.id === incomingTx.id);
             if (idx >= 0) {
-              const current = prev[idx];
-              // 1. Never overwrite local pending edits
-              if (current.syncStatus === 'PENDING') {
-                return prev;
-              }
-              // 2. Never overwrite if local record is newer
-              if (
-                current.updatedAt &&
-                incomingTx.updatedAt &&
-                incomingTx.updatedAt < current.updatedAt
-              ) {
-                return prev;
-              }
-              // 3. Skip if already identical
-              if (
-                current.amountPaise === incomingTx.amountPaise &&
-                current.title === incomingTx.title &&
-                current.isReversed === incomingTx.isReversed &&
-                current.notes === incomingTx.notes &&
-                current.fromMemberId === incomingTx.fromMemberId &&
-                current.paidByMemberId === incomingTx.paidByMemberId
-              ) {
-                return prev;
-              }
-              shouldToast = true;
               const copy = [...prev];
-              copy[idx] = incomingTx;
-              saveTransactionLocal(incomingTx);
+              copy[idx] = {
+                ...incomingTx,
+                syncStatus: 'SYNCED',
+                lifecycleStatus: 'SYNCED',
+              };
               return copy;
             }
-            shouldToast = true;
-            saveTransactionLocal(incomingTx);
-            return [incomingTx, ...prev];
+            return [
+              {
+                ...incomingTx,
+                syncStatus: 'SYNCED',
+                lifecycleStatus: 'SYNCED',
+              },
+              ...prev,
+            ];
           });
 
-          if (shouldToast) {
-            const isContrib = incomingTx.type === 'CONTRIBUTION';
-            const title = isContrib
-              ? `Pool deposit ${formatCurrency(incomingTx.amountPaise, incomingTx.currency)}`
-              : `Expense "${incomingTx.title}" (${formatCurrency(incomingTx.amountPaise, incomingTx.currency)})`;
-            setStatusToast({
-              message: `⚡ Live Update: ${title} synced!`,
-              type: 'SUCCESS',
-            });
-          }
+          const isContrib = incomingTx.type === 'CONTRIBUTION';
+          const title = isContrib
+            ? `Pool deposit ${formatCurrency(incomingTx.amountPaise, incomingTx.currency)}`
+            : `Expense "${incomingTx.title}" (${formatCurrency(incomingTx.amountPaise, incomingTx.currency)})`;
+          setStatusToast({
+            message: `⚡ Live Update: ${title} synced!`,
+            type: 'SUCCESS',
+          });
         } else if (event.type === 'TRANSACTION_DELETED' && event.txId) {
           await deleteTransactionLocal(event.txId);
           setTransactions((prev) => prev.filter((item) => item.id !== event.txId));

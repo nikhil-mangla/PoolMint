@@ -818,7 +818,7 @@ export async function importSharedTripData(
         syncStatus: 'SYNCED',
         lifecycleStatus: 'SYNCED',
       });
-    } else {
+    } else if (existing.syncStatus !== 'PENDING') {
       const hasChanged =
         existing.amountPaise !== tx.amountPaise ||
         existing.title !== tx.title ||
@@ -828,13 +828,9 @@ export async function importSharedTripData(
         existing.fromMemberId !== tx.fromMemberId ||
         existing.paidByMemberId !== tx.paidByMemberId ||
         existing.paymentMethod !== tx.paymentMethod ||
-        existing.dateTime !== tx.dateTime ||
-        existing.updatedAt !== tx.updatedAt;
+        existing.dateTime !== tx.dateTime;
 
-      const isNewerOrEqual =
-        !existing.updatedAt || !tx.updatedAt || tx.updatedAt >= existing.updatedAt;
-
-      if (hasChanged && isNewerOrEqual) {
+      if (hasChanged) {
         updatedTxCount += 1;
         await saveTransactionLocal({
           ...tx,
