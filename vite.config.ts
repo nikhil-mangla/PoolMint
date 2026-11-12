@@ -14,8 +14,8 @@ export default defineConfig(() => {
         includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
-          name: 'PoolMint — Travel Expense & Group Treasury',
-          short_name: 'PoolMint',
+          name: 'Pool Mint — Travel Expense & Group Treasury',
+          short_name: 'Pool Mint',
           description: 'Offline-first shared travel wallet and double-entry group treasury manager for trips with friends.',
           theme_color: '#0f172a',
           background_color: '#0f172a',

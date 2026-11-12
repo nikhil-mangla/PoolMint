@@ -52,7 +52,12 @@ import {
   validateAndRestoreBackupToIndexedDB,
   generateUniqueId,
   updateSyncLifecycleStatusLocal,
+  importSharedTripData,
 } from './services/indexedDb';
+import {
+  generateTripShareUrl,
+  parseJoinPayloadFromLocation,
+} from './utils/shareTrip';
 import { DashboardView } from './components/DashboardView';
 import { PoolView } from './components/PoolView';
 import { TransferView } from './components/TransferView';
@@ -62,6 +67,7 @@ import { TripModal } from './components/TripModal';
 import { QuickActionModal } from './components/QuickActionModal';
 import { EditTransactionModal } from './components/EditTransactionModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { JoinTripModal } from './components/JoinTripModal';
 
 type NavTab = 'HOME' | 'POOL' | 'TRANSFER' | 'EXPENSES' | 'MORE';
 
@@ -128,8 +134,24 @@ export default function App() {
   const [editingTransactionModalTx, setEditingTransactionModalTx] =
     useState<Transaction | null>(null);
   const [inviteModalOpen, setInviteModalOpen] = useState<boolean>(false);
+  const [shareUrl, setShareUrl] = useState<string>('');
+  const [isGeneratingShareUrl, setIsGeneratingShareUrl] = useState<boolean>(false);
+  const [pendingJoinPayload, setPendingJoinPayload] = useState<{
+    trip: Trip;
+    transactions: Transaction[];
+  } | null>(null);
+  const [isExistingTripJoin, setIsExistingTripJoin] = useState<boolean>(false);
+  const [statusToast, setStatusToast] = useState<{ message: string; type: 'SUCCESS' | 'INFO' } | null>(null);
   const [deleteTripConfirmOpen, setDeleteTripConfirmOpen] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
+
+  // Auto-dismiss status toast after 4 seconds
+  useEffect(() => {
+    if (statusToast) {
+      const timer = setTimeout(() => setStatusToast(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [statusToast]);
 
   // PIN Lock State
   const [pinHash, setPinHash] = useState<string | null>(() =>
@@ -153,14 +175,48 @@ export default function App() {
   // Load initial Dexie IndexedDB data immediately without waiting for network
   useEffect(() => {
     initializeLocalDatabase()
-      .then((data) => {
+      .then(async (data) => {
         setTrips(data.trips);
         setTransactions(data.transactions);
         setAuditLogs(data.auditLogs);
         setLastSyncedAt(data.lastSyncedAt);
-        if (data.trips.length > 0) {
-          setActiveTripId(data.trips[0].id);
-          setActiveViewerMemberId(data.trips[0].treasurerMemberId || data.trips[0].members[0]?.id || 'mem-1');
+
+        // Check if there is an incoming join payload in the URL (#join=... or ?join=...)
+        const joinPayload = await parseJoinPayloadFromLocation();
+        if (joinPayload) {
+          setPendingJoinPayload(joinPayload);
+          const existing = data.trips.some((t) => t.id === joinPayload.trip.id);
+          setIsExistingTripJoin(existing);
+          if (existing) {
+            setActiveTripId(joinPayload.trip.id);
+          } else if (data.trips.length > 0) {
+            setActiveTripId(data.trips[0].id);
+          }
+        } else {
+          // Check for URL query param ?trip=<id>
+          if (typeof window !== 'undefined') {
+            const urlParams = new URLSearchParams(window.location.search);
+            const tripParam = urlParams.get('trip');
+            if (tripParam && data.trips.some((t) => t.id === tripParam)) {
+              setActiveTripId(tripParam);
+              const matched = data.trips.find((t) => t.id === tripParam);
+              if (matched) {
+                setActiveViewerMemberId(matched.treasurerMemberId || matched.members[0]?.id || 'mem-1');
+              }
+            } else if (tripParam && !data.trips.some((t) => t.id === tripParam)) {
+              setStatusToast({
+                message: '⚠️ Trip not found on this device. Ask your friend for an updated invite link.',
+                type: 'INFO',
+              });
+              if (data.trips.length > 0) {
+                setActiveTripId(data.trips[0].id);
+                setActiveViewerMemberId(data.trips[0].treasurerMemberId || data.trips[0].members[0]?.id || 'mem-1');
+              }
+            } else if (data.trips.length > 0) {
+              setActiveTripId(data.trips[0].id);
+              setActiveViewerMemberId(data.trips[0].treasurerMemberId || data.trips[0].members[0]?.id || 'mem-1');
+            }
+          }
         }
       })
       .finally(() => setLoading(false));
@@ -384,6 +440,21 @@ export default function App() {
     if (!activeTrip) return null;
     return computeTripAccounting(activeTrip, transactions);
   }, [activeTrip, transactions]);
+
+  // Generate live compressed share URL whenever invite modal opens or active trip changes
+  useEffect(() => {
+    if (inviteModalOpen && activeTrip) {
+      setIsGeneratingShareUrl(true);
+      generateTripShareUrl(activeTrip, transactions)
+        .then((url) => setShareUrl(url))
+        .catch((err) => {
+          console.error('Failed to generate share URL:', err);
+          const origin = typeof window !== 'undefined' ? window.location.origin : 'https://poolmint.app';
+          setShareUrl(`${origin}/?trip=${encodeURIComponent(activeTrip.id)}`);
+        })
+        .finally(() => setIsGeneratingShareUrl(false));
+    }
+  }, [inviteModalOpen, activeTrip, transactions]);
 
   const appendTransaction = async (tx: Transaction, auditNote: string) => {
     const actorName =
@@ -724,6 +795,35 @@ export default function App() {
     setActiveTripId(tripObj.id);
   };
 
+  const handleJoinTripFromPayload = async ({
+    trip,
+    transactions: incomingTxs,
+    selectedMemberId,
+  }: {
+    trip: Trip;
+    transactions: Transaction[];
+    selectedMemberId: string;
+  }) => {
+    const result = await importSharedTripData(trip, incomingTxs);
+    setTrips(result.trips);
+    setTransactions(result.transactions);
+    setActiveTripId(trip.id);
+    setActiveViewerMemberId(selectedMemberId);
+    setPendingJoinPayload(null);
+
+    // Clean URL without reloading the page
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+
+    setStatusToast({
+      message: result.isNewTrip
+        ? `🎉 Joined "${trip.name}"! Loaded ${result.importedTxCount} transactions.`
+        : `🔄 Updated "${trip.name}"! Synced ${result.importedTxCount} new transactions.`,
+      type: 'SUCCESS',
+    });
+  };
+
   const handleAddMemberInline = async (memberName: string): Promise<string | null> => {
     if (!activeTrip) return null;
     const trimmed = memberName.trim();
@@ -826,7 +926,7 @@ export default function App() {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 text-slate-600 dark:text-slate-300 text-sm">
-        Loading PoolMint Travel Treasury...
+        Loading Pool Mint Travel Treasury...
       </div>
     );
   }
@@ -879,7 +979,7 @@ export default function App() {
           className="w-full max-w-sm rounded-2xl bg-slate-900 border border-slate-800 p-6 space-y-4 text-center"
         >
           <Lock className="w-10 h-10 text-emerald-400 mx-auto" />
-          <h1 className="text-xl font-bold">PoolMint PIN Locked</h1>
+          <h1 className="text-xl font-bold">Pool Mint PIN Locked</h1>
           <p className="text-xs text-slate-400">
             Enter your 4-digit security PIN to access group treasury records.
           </p>
@@ -904,13 +1004,14 @@ export default function App() {
     );
   }
 
-  const shareUrl =
-    typeof window !== 'undefined'
-      ? `${window.location.origin}/?trip=${encodeURIComponent(activeTrip.id)}`
-      : `https://poolmint.app/?trip=${activeTrip.id}`;
-
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col">
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col relative">
+      {/* GLOBAL TOAST BANNER */}
+      {statusToast && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-900/95 dark:bg-emerald-950/95 text-white border border-emerald-500/50 shadow-2xl backdrop-blur-md text-xs font-semibold animate-in fade-in slide-in-from-top duration-200">
+          <span>{statusToast.message}</span>
+        </div>
+      )}
       {/* TOP BAR CONTRACT: 3-Zone Header with iOS Safe Area Top Padding */}
       <header className="sticky top-0 z-30 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 px-4 sm:px-6 pt-safe min-h-[56px] flex items-center justify-between gap-4">
         {/* Zone 1: Single text element wordmark */}
@@ -922,7 +1023,7 @@ export default function App() {
           }}
           className="text-lg font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0"
         >
-          PoolMint
+          Pool Mint
         </a>
 
         {/* Zone 2: Desktop Navigation Links (single-line) */}
@@ -1381,6 +1482,16 @@ export default function App() {
         />
       )}
 
+      {/* JOIN TRIP INVITATION MODAL */}
+      {pendingJoinPayload && (
+        <JoinTripModal
+          payload={pendingJoinPayload}
+          isExistingTrip={isExistingTripJoin}
+          onJoin={handleJoinTripFromPayload}
+          onClose={() => setPendingJoinPayload(null)}
+        />
+      )}
+
       {/* TRACKMYSHARE-STYLE SHARE TRIP LINK & PIN MODAL */}
       {inviteModalOpen && (
         <div
@@ -1400,36 +1511,41 @@ export default function App() {
                   Share “{activeTrip.name}” with friends
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                  Share this link in your group chat. Friends can view the live Common Pool balance ({formatCurrency(report.totalPoolBalancePaise, activeTrip.currency)}) and log expenses.
+                  Share this link with your friends. When they open it, this trip, all members, and current expenses will load on their phone instantly!
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => setInviteModalOpen(false)}
-                className="p-1.5 text-slate-400 hover:text-slate-600"
+                className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
+            {/* Link Box */}
             <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 p-3 flex items-center justify-between gap-2">
               <span className="text-xs font-mono text-slate-700 dark:text-slate-200 truncate">
-                {shareUrl}
+                {isGeneratingShareUrl ? 'Generating live invite link...' : (shareUrl || 'Generating...')}
               </span>
               <button
                 type="button"
+                disabled={isGeneratingShareUrl || !shareUrl}
                 onClick={() => {
+                  if (!shareUrl) return;
                   navigator.clipboard?.writeText(shareUrl);
                   setCopiedLink(true);
                   setTimeout(() => setCopiedLink(false), 2500);
+                  setStatusToast({ message: '🔗 Invite link copied to clipboard!', type: 'SUCCESS' });
                 }}
-                className="rounded-lg bg-slate-900 dark:bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white shrink-0 flex items-center gap-1"
+                className="rounded-lg bg-slate-900 dark:bg-emerald-600 hover:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-white shrink-0 flex items-center gap-1 disabled:opacity-50"
               >
                 {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>{copiedLink ? 'Copied' : 'Copy'}</span>
               </button>
             </div>
 
+            {/* Common Pool Highlight */}
             <div className="rounded-xl border border-amber-200 dark:border-amber-800/60 bg-amber-50/70 dark:bg-amber-950/30 p-3.5 flex items-center justify-between">
               <div>
                 <p className="text-xs font-semibold text-amber-900 dark:text-amber-300">
@@ -1445,23 +1561,54 @@ export default function App() {
               <Share2 className="w-5 h-5 text-amber-600" />
             </div>
 
+            {/* Info Badge */}
+            <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 text-[11px] text-emerald-800 dark:text-emerald-300 space-y-1">
+              <p className="font-semibold flex items-center gap-1">
+                <span>💡</span> Live Trip Snapshot Included
+              </p>
+              <p className="text-emerald-700/90 dark:text-emerald-400/90 leading-relaxed">
+                Opening this link on a friend&apos;s phone will automatically import {activeTrip.members.length} members and {transactions.filter((t) => t.tripId === activeTrip.id).length} recorded transactions directly into their local wallet — no account or login needed.
+              </p>
+            </div>
+
+            {/* Action Buttons */}
             <div className="grid grid-cols-2 gap-2.5 pt-2">
               <button
                 type="button"
-                onClick={() => {
-                  const inviteText = `🧳 Join our trip "${activeTrip.name}" (${activeTrip.destination})!\n💰 Common Pool Available: ${formatCurrency(report.totalPoolBalancePaise, activeTrip.currency)}\n🔗 Link: ${shareUrl}`;
+                disabled={isGeneratingShareUrl || !shareUrl}
+                onClick={async () => {
+                  if (!shareUrl) return;
+                  const memberList = activeTrip.members.map((m) => m.name).join(', ');
+                  const inviteText = `🧳 Join our trip "${activeTrip.name}" (${activeTrip.destination})!\n👥 Members: ${memberList}\n💰 Common Pool Available: ${formatCurrency(report.totalPoolBalancePaise, activeTrip.currency)}\n🔗 Link: ${shareUrl}`;
+
+                  if (typeof navigator !== 'undefined' && navigator.share) {
+                    try {
+                      await navigator.share({
+                        title: `Join ${activeTrip.name} on Pool Mint`,
+                        text: inviteText,
+                        url: shareUrl,
+                      });
+                      return;
+                    } catch (err: any) {
+                      if (err.name === 'AbortError') return;
+                    }
+                  }
+
+                  // Fallback to clipboard
                   navigator.clipboard?.writeText(inviteText);
                   setCopiedLink(true);
                   setTimeout(() => setCopiedLink(false), 2500);
+                  setStatusToast({ message: '💬 Invite message copied to clipboard!', type: 'SUCCESS' });
                 }}
-                className="rounded-xl bg-emerald-600 hover:bg-emerald-500 py-2.5 px-3 text-xs font-semibold text-white"
+                className="rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 py-2.5 px-3 text-xs font-semibold text-white flex items-center justify-center gap-1.5 shadow-md transition-colors"
               >
-                Copy Invite Message
+                <Share2 className="w-3.5 h-3.5" />
+                <span>Share via Apps</span>
               </button>
               <button
                 type="button"
                 onClick={() => setInviteModalOpen(false)}
-                className="rounded-xl border border-slate-200 dark:border-slate-700 py-2.5 px-3 text-xs font-semibold text-slate-700 dark:text-slate-300"
+                className="rounded-xl border border-slate-200 dark:border-slate-700 py-2.5 px-3 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
               >
                 Done
               </button>

@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "PoolMint — Travel Expense & Group Treasury",
-  "short_name": "PoolMint",
+  "name": "Pool Mint — Travel Expense & Group Treasury",
+  "short_name": "Pool Mint",
   "description": "Offline-first shared travel wallet and double-entry group treasury manager for trips with friends.",
   "start_url": "/",
   "scope": "/",

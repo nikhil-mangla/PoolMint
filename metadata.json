@@ -1,5 +1,5 @@
 {
-  "name": "PoolMint — Travel Expense & Group Treasury PWA",
+  "name": "Pool Mint — Travel Expense & Group Treasury PWA",
   "description": "Offline-first shared travel wallet and double-entry group treasury manager for trips with friends.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

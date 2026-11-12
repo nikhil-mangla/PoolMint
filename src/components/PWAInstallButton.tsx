@@ -44,7 +44,7 @@ export const PWAInstallButton: React.FC = () => {
           <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 shadow-xl">
             <div className="flex items-center justify-between">
               <h3 id="pwa-install-title" className="text-base font-semibold text-slate-900 dark:text-white">
-                Install PoolMint for Offline Travel
+                Install Pool Mint for Offline Travel
               </h3>
               <button
                 type="button"
@@ -56,18 +56,18 @@ export const PWAInstallButton: React.FC = () => {
               </button>
             </div>
             <p className="mt-2 text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-              PoolMint caches its application shell and your IndexedDB ledger locally so you can record expenses in remote areas with zero signal.
+              Pool Mint caches its application shell and your IndexedDB ledger locally so you can record expenses in remote areas with zero signal.
             </p>
             <div className="mt-4 space-y-2 text-xs text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-800/60 p-3.5 rounded-xl border border-slate-200/70 dark:border-slate-700/60">
               {isIOS ? (
                 <>
                   <p>1. Tap the <strong>Share</strong> icon in your Safari toolbar.</p>
                   <p>2. Scroll down and tap <strong>Add to Home Screen</strong>.</p>
-                  <p>3. Launch PoolMint from your Home Screen anytime, even in Airplane mode.</p>
+                  <p>3. Launch Pool Mint from your Home Screen anytime, even in Airplane mode.</p>
                 </>
               ) : (
                 <>
-                  <p>1. Click the <strong>Install PoolMint</strong> icon in your browser address bar (or open Browser Menu &rarr; <strong>Install App / Add to Home Screen</strong>).</p>
+                  <p>1. Click the <strong>Install Pool Mint</strong> icon in your browser address bar (or open Browser Menu &rarr; <strong>Install App / Add to Home Screen</strong>).</p>
                   <p>2. Once installed, all trips, expenses, and balances work 100% offline.</p>
                 </>
               )}

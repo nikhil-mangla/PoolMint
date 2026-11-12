@@ -272,7 +272,7 @@ export const MoreView: React.FC<MoreViewProps> = ({
     setErrorMessage('');
     const backup = {
       schemaVersion: 2,
-      application: 'PoolMint Travel Expense & Group Treasury PWA',
+      application: 'Pool Mint Travel Expense & Group Treasury PWA',
       exportedAt: new Date().toISOString(),
       trips: allTrips,
       transactions,

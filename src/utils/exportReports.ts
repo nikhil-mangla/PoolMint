@@ -9,7 +9,7 @@ export function exportTripToCSV(
 ) {
   const memberNameMap = new Map(trip.members.map((m) => [m.id, m.name]));
   const rows: string[][] = [
-    ['PoolMint Travel Treasury Report'],
+    ['Pool Mint Travel Treasury Report'],
     ['Trip Name', trip.name],
     ['Destination', trip.destination],
     ['Dates', `${trip.startDate} to ${trip.endDate}`],
@@ -122,7 +122,7 @@ export function exportTripToPDF(
   let y = 18;
 
   doc.setFontSize(16);
-  doc.text(`PoolMint Treasury Report: ${trip.name}`, 14, y);
+  doc.text(`Pool Mint Treasury Report: ${trip.name}`, 14, y);
   y += 7;
 
   doc.setFontSize(10);

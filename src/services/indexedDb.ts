@@ -775,3 +775,67 @@ export async function validateAndRestoreBackupToIndexedDB(rawPayload: any): Prom
     skippedDuplicatesCount,
   };
 }
+
+/**
+ * Imports a shared trip payload into local IndexedDB and merges its transactions.
+ */
+export async function importSharedTripData(
+  trip: Trip,
+  transactions: Transaction[]
+): Promise<{
+  trips: Trip[];
+  transactions: Transaction[];
+  isNewTrip: boolean;
+  importedTxCount: number;
+  updatedTxCount: number;
+}> {
+  const existingTrips = await localDb.Trips.toArray();
+  const existingTrip = existingTrips.find((t) => t.id === trip.id);
+  const isNewTrip = !existingTrip;
+
+  // Save / Update Trip and its members
+  const tripToSave: Trip = {
+    ...trip,
+    syncStatus: 'SYNCED',
+    lifecycleStatus: 'SYNCED',
+  };
+  await saveTripLocal(tripToSave);
+
+  // Existing transactions for this trip
+  const existingTxs = await localDb.TransactionLedger.where('tripId').equals(trip.id).toArray();
+  const existingTxMap = new Map(existingTxs.map((tx) => [tx.id, tx]));
+
+  let importedTxCount = 0;
+  let updatedTxCount = 0;
+
+  for (const tx of transactions) {
+    const existing = existingTxMap.get(tx.id);
+    if (!existing) {
+      importedTxCount += 1;
+      await saveTransactionLocal({
+        ...tx,
+        syncStatus: 'SYNCED',
+        lifecycleStatus: 'SYNCED',
+      });
+    } else if (tx.updatedAt && (!existing.updatedAt || tx.updatedAt > existing.updatedAt)) {
+      updatedTxCount += 1;
+      await saveTransactionLocal({
+        ...tx,
+        syncStatus: 'SYNCED',
+        lifecycleStatus: 'SYNCED',
+      });
+    }
+  }
+
+  // Load freshly updated data from IndexedDB
+  const allTrips = await localDb.Trips.toArray();
+  const allTransactions = await localDb.TransactionLedger.toArray();
+
+  return {
+    trips: allTrips.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+    transactions: allTransactions.sort((a, b) => b.dateTime.localeCompare(a.dateTime)),
+    isNewTrip,
+    importedTxCount,
+    updatedTxCount,
+  };
+}
