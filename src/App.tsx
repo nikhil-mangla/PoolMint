@@ -269,9 +269,17 @@ export default function App() {
     return { syncStateLabel: 'ONLINE', syncIndicatorColor: 'GREEN' };
   }, [isEffectiveOnline, isSyncing, syncError, pendingSyncCount, justSynced]);
 
+  const activeTrip = useMemo(
+    () => trips.find((t) => t.id === activeTripId) || trips[0],
+    [trips, activeTripId]
+  );
+
+  const wasOfflineRef = useRef(false);
+
   /**
-   * Phase 4: Offline Synchronization Engine with Exponential Backoff Retry
-   * Lifecycle: LOCAL_SAVE -> PENDING_SYNC -> SYNCING -> SYNCED (or RETRY on failure)
+   * Phase 4: Offline Synchronization Engine with Live Group Broadcast
+   * Flushes local pending transactions & trip state to friends via live sync channel,
+   * updates Dexie IndexedDB sync lifecycle to SYNCED, and optionally pushes to Cloud SQL.
    */
   const synchronizeWithBackend = useCallback(async () => {
     if (!isEffectiveOnline || isSyncing) return;
@@ -281,99 +289,144 @@ export default function App() {
     try {
       await updateSyncLifecycleStatusLocal('SYNCING');
 
-      const healthRes = await fetch('/api/health', { cache: 'no-store' });
-      if (!healthRes.ok) {
-        throw new Error('Server health check returned non-200 status');
+      // 1. Live broadcast every pending transaction so friends listening via SSE update instantly
+      const pendingTxs = transactions.filter((tx) => tx.syncStatus === 'PENDING');
+      for (const tx of pendingTxs) {
+        const cleanTx: Transaction = {
+          ...tx,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        };
+        await broadcastTripEvent(tx.tripId, {
+          type: 'TRANSACTION_SAVED',
+          tx: cleanTx,
+        });
       }
 
-      if (cloudUser) {
-        const token = await cloudUser.getIdToken();
-        const payload = {
-          trips: trips.map((t) => ({
-            id: t.id,
-            name: t.name,
-            destination: t.destination,
-            startDate: t.startDate,
-            endDate: t.endDate,
-            currency: t.currency,
-            budgetPaise: t.budgetPaise,
-            description: t.description,
-            treasurerMemberId: t.treasurerMemberId,
-            status: t.status,
-            allowNegativePool: t.allowNegativePool,
-            membersJson: JSON.stringify(t.members),
-            customCategoriesJson: JSON.stringify(t.customCategories || []),
-            closedAt: t.closedAt || null,
-            updatedAt: t.updatedAt,
-          })),
-          transactions: transactions.map((tx) => ({
-            id: tx.id,
-            tripId: tx.tripId,
-            type: tx.type,
-            title: tx.title,
-            amountPaise: tx.amountPaise,
-            currency: tx.currency,
-            dateTime: tx.dateTime,
-            paymentMethod: tx.paymentMethod,
-            fromMemberId: tx.fromMemberId || null,
-            toMemberId: tx.toMemberId || null,
-            reference: tx.reference || null,
-            category: tx.category || null,
-            paidByMemberId: tx.paidByMemberId || null,
-            paymentSource: tx.paymentSource || null,
-            splitMethod: tx.splitMethod || null,
-            splitsJson: tx.splits ? JSON.stringify(tx.splits) : null,
-            receiptDataUrl: tx.receiptDataUrl || null,
-            notes: tx.notes || '',
-            isReversed: tx.isReversed,
-            reversalOfId: tx.reversalOfId || null,
-            reversedById: tx.reversedById || null,
-            createdByMemberId: tx.createdByMemberId,
-            updatedAt: tx.updatedAt,
-          })),
-          auditLogs: auditLogs.map((l) => ({
-            id: l.id,
-            tripId: l.tripId,
-            transactionId: l.transactionId,
-            action: l.action,
-            actorName: l.actorName,
-            timestamp: l.timestamp,
-            previousValueJson: l.previousValueJson || null,
-            newValueJson: l.newValueJson || null,
-            notes: l.notes || '',
-          })),
-        };
-
-        const syncRes = await fetch('/api/cloud/sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(payload),
+      // 2. Broadcast pending deletions from audit logs if any
+      const pendingDelLogs = auditLogs.filter(
+        (l) => l.syncStatus === 'PENDING' && l.action === 'REVERSED' && l.transactionId
+      );
+      for (const l of pendingDelLogs) {
+        await broadcastTripEvent(l.tripId, {
+          type: 'TRANSACTION_DELETED',
+          txId: l.transactionId!,
         });
+      }
 
-        if (!syncRes.ok) {
-          throw new Error('Cloud SQL synchronization failed');
+      // 3. Broadcast full SYNC_SNAPSHOT of active trip so all friends get the complete synchronized ledger
+      if (activeTrip?.id) {
+        const tripTxs = transactions
+          .filter((tx) => tx.tripId === activeTrip.id)
+          .map((tx) => ({
+            ...tx,
+            syncStatus: 'SYNCED' as const,
+            lifecycleStatus: 'SYNCED' as const,
+          }));
+
+        await broadcastTripEvent(activeTrip.id, {
+          type: 'SYNC_SNAPSHOT',
+          trip: {
+            ...activeTrip,
+            syncStatus: 'SYNCED',
+            lifecycleStatus: 'SYNCED',
+          },
+          transactions: tripTxs,
+        });
+      }
+
+      // 4. Mark all local Dexie IndexedDB records as SYNCED
+      const marked = await markAllSyncedLocal(trips, transactions, auditLogs);
+      setTrips(marked.trips);
+      setTransactions(marked.transactions);
+      setAuditLogs(marked.auditLogs);
+      setLastSyncedAt(marked.lastSyncedAt);
+
+      // 5. Optional Cloud SQL sync (if cloud user is signed in)
+      if (cloudUser) {
+        try {
+          const token = await cloudUser.getIdToken();
+          const payload = {
+            trips: trips.map((t) => ({
+              id: t.id,
+              name: t.name,
+              destination: t.destination,
+              startDate: t.startDate,
+              endDate: t.endDate,
+              currency: t.currency,
+              budgetPaise: t.budgetPaise,
+              description: t.description,
+              treasurerMemberId: t.treasurerMemberId,
+              status: t.status,
+              allowNegativePool: t.allowNegativePool,
+              membersJson: JSON.stringify(t.members),
+              customCategoriesJson: JSON.stringify(t.customCategories || []),
+              closedAt: t.closedAt || null,
+              updatedAt: t.updatedAt,
+            })),
+            transactions: transactions.map((tx) => ({
+              id: tx.id,
+              tripId: tx.tripId,
+              type: tx.type,
+              title: tx.title,
+              amountPaise: tx.amountPaise,
+              currency: tx.currency,
+              dateTime: tx.dateTime,
+              paymentMethod: tx.paymentMethod,
+              fromMemberId: tx.fromMemberId || null,
+              toMemberId: tx.toMemberId || null,
+              reference: tx.reference || null,
+              category: tx.category || null,
+              paidByMemberId: tx.paidByMemberId || null,
+              paymentSource: tx.paymentSource || null,
+              splitMethod: tx.splitMethod || null,
+              splitsJson: tx.splits ? JSON.stringify(tx.splits) : null,
+              receiptDataUrl: tx.receiptDataUrl || null,
+              notes: tx.notes || '',
+              isReversed: tx.isReversed,
+              reversalOfId: tx.reversalOfId || null,
+              reversedById: tx.reversedById || null,
+              createdByMemberId: tx.createdByMemberId,
+              updatedAt: tx.updatedAt,
+            })),
+            auditLogs: auditLogs.map((l) => ({
+              id: l.id,
+              tripId: l.tripId,
+              transactionId: l.transactionId,
+              action: l.action,
+              actorName: l.actorName,
+              timestamp: l.timestamp,
+              previousValueJson: l.previousValueJson || null,
+              newValueJson: l.newValueJson || null,
+              notes: l.notes || '',
+            })),
+          };
+
+          const syncRes = await fetch('/api/cloud/sync', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify(payload),
+          });
+
+          if (syncRes.ok) {
+            const body = await syncRes.json();
+            const merged = await mergeCloudAndLocalData(
+              trips,
+              transactions,
+              auditLogs,
+              body.data
+            );
+            setTrips(merged.trips);
+            setTransactions(merged.transactions);
+            setAuditLogs(merged.auditLogs);
+            setLastSyncedAt(merged.lastSyncedAt);
+          }
+        } catch (cloudErr) {
+          console.warn('Optional Cloud SQL sync skipped:', cloudErr);
         }
-
-        const body = await syncRes.json();
-        const merged = await mergeCloudAndLocalData(
-          trips,
-          transactions,
-          auditLogs,
-          body.data
-        );
-        setTrips(merged.trips);
-        setTransactions(merged.transactions);
-        setAuditLogs(merged.auditLogs);
-        setLastSyncedAt(merged.lastSyncedAt);
-      } else {
-        const marked = await markAllSyncedLocal(trips, transactions, auditLogs);
-        setTrips(marked.trips);
-        setTransactions(marked.transactions);
-        setAuditLogs(marked.auditLogs);
-        setLastSyncedAt(marked.lastSyncedAt);
       }
 
       retryAttemptRef.current = 0;
@@ -383,6 +436,13 @@ export default function App() {
       }
       setJustSynced(true);
       setTimeout(() => setJustSynced(false), 4000);
+
+      if (pendingTxs.length > 0) {
+        setStatusToast({
+          message: `⚡ Back online: Synced ${pendingTxs.length} offline change(s) to friends!`,
+          type: 'SUCCESS',
+        });
+      }
     } catch (err: any) {
       await updateSyncLifecycleStatusLocal('RETRY', err?.message);
       setSyncError(err?.message || 'Synchronization failed');
@@ -402,7 +462,7 @@ export default function App() {
     } finally {
       setIsSyncing(false);
     }
-  }, [isEffectiveOnline, isSyncing, cloudUser, trips, transactions, auditLogs]);
+  }, [isEffectiveOnline, isSyncing, cloudUser, trips, transactions, auditLogs, activeTrip]);
 
   // Listen to online/offline + iOS Safari foreground resume (visibilitychange & focus)
   useEffect(() => {
@@ -442,10 +502,15 @@ export default function App() {
     }
   }, [isEffectiveOnline, pendingSyncCount, isSyncing, syncError, synchronizeWithBackend]);
 
-  const activeTrip = useMemo(
-    () => trips.find((t) => t.id === activeTripId) || trips[0],
-    [trips, activeTripId]
-  );
+  // Automatic trigger whenever device regains internet connection
+  useEffect(() => {
+    if (!isEffectiveOnline) {
+      wasOfflineRef.current = true;
+    } else if (wasOfflineRef.current) {
+      wasOfflineRef.current = false;
+      synchronizeWithBackend();
+    }
+  }, [isEffectiveOnline, synchronizeWithBackend]);
 
   const report = useMemo(() => {
     if (!activeTrip) return null;
@@ -974,14 +1039,26 @@ export default function App() {
 
   const handleManualBroadcast = async () => {
     if (!activeTrip) return;
-    const currentTxs = transactions.filter((tx) => tx.tripId === activeTrip.id);
+    const currentTxs = transactions
+      .filter((tx) => tx.tripId === activeTrip.id)
+      .map((tx) => ({ ...tx, syncStatus: 'SYNCED' as const, lifecycleStatus: 'SYNCED' as const }));
+
+    // Mark all synced in local database as well
+    const marked = await markAllSyncedLocal(trips, transactions, auditLogs);
+    setTrips(marked.trips);
+    setTransactions(marked.transactions);
+    setAuditLogs(marked.auditLogs);
+    setLastSyncedAt(marked.lastSyncedAt);
+
     await broadcastTripEvent(activeTrip.id, {
       type: 'SYNC_SNAPSHOT',
-      trip: activeTrip,
+      trip: { ...activeTrip, syncStatus: 'SYNCED', lifecycleStatus: 'SYNCED' },
       transactions: currentTxs,
     });
+    setJustSynced(true);
+    setTimeout(() => setJustSynced(false), 4000);
     setStatusToast({
-      message: `⚡ Live Synced ${currentTxs.length} transactions to all friends!`,
+      message: `⚡ Live Synced ${currentTxs.length} transaction(s) to all friends!`,
       type: 'SUCCESS',
     });
   };

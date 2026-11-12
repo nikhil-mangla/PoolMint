@@ -112,45 +112,81 @@ export function subscribeToTripLive(
   catchUpRecentEvents();
 
   // 2. Connect to real-time Server-Sent Events stream
-  try {
-    eventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
-
-    eventSource.onopen = () => {
-      if (!isClosed && onConnectionChange) {
-        onConnectionChange(true);
-      }
-    };
-
-    eventSource.onmessage = (e) => {
-      if (isClosed) return;
+  const connectSSE = () => {
+    if (isClosed) return;
+    if (eventSource) {
       try {
-        const item = JSON.parse(e.data);
-        if (item.event === 'message' && item.message) {
-          if (item.id && processedMessageIds.has(item.id)) return;
-          if (item.id) processedMessageIds.add(item.id);
+        eventSource.close();
+      } catch {
+        // ignore
+      }
+      eventSource = null;
+    }
 
-          const payload: LiveSyncEvent = JSON.parse(item.message);
-          if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
-            onEvent(payload);
-          }
+    try {
+      eventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
+
+      eventSource.onopen = () => {
+        if (!isClosed && onConnectionChange) {
+          onConnectionChange(true);
         }
-      } catch (err) {
-        console.warn('Error parsing incoming live sync message:', err);
-      }
-    };
+      };
 
-    eventSource.onerror = () => {
-      if (!isClosed && onConnectionChange) {
-        onConnectionChange(false);
-      }
-    };
-  } catch (err) {
-    console.warn('Failed to initialize EventSource for live sync:', err);
-  }
+      eventSource.onmessage = (e) => {
+        if (isClosed) return;
+        try {
+          const item = JSON.parse(e.data);
+          if (item.event === 'message' && item.message) {
+            if (item.id && processedMessageIds.has(item.id)) return;
+            if (item.id) processedMessageIds.add(item.id);
+
+            const payload: LiveSyncEvent = JSON.parse(item.message);
+            if (payload && payload.senderClientId !== CLIENT_ID && payload.tripId === tripId) {
+              onEvent(payload);
+            }
+          }
+        } catch (err) {
+          console.warn('Error parsing incoming live sync message:', err);
+        }
+      };
+
+      eventSource.onerror = () => {
+        if (!isClosed && onConnectionChange) {
+          onConnectionChange(false);
+        }
+      };
+    } catch (err) {
+      console.warn('Failed to initialize EventSource for live sync:', err);
+    }
+  };
+
+  connectSSE();
+
+  // 3. Auto-reconnect & catch-up when coming back online or switching tabs/apps
+  const handleWakeOrReconnect = () => {
+    if (isClosed) return;
+    catchUpRecentEvents();
+    if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+      connectSSE();
+    }
+  };
+
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === 'visible') {
+      handleWakeOrReconnect();
+    }
+  };
+
+  window.addEventListener('online', handleWakeOrReconnect);
+  window.addEventListener('focus', handleWakeOrReconnect);
+  document.addEventListener('visibilitychange', handleVisibilityChange);
 
   // Return cleanup function to disconnect
   return () => {
     isClosed = true;
+    window.removeEventListener('online', handleWakeOrReconnect);
+    window.removeEventListener('focus', handleWakeOrReconnect);
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
     if (eventSource) {
       eventSource.close();
       eventSource = null;

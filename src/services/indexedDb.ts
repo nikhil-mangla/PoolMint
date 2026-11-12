@@ -804,6 +804,7 @@ export async function importSharedTripData(
   // Existing transactions for this trip
   const existingTxs = await localDb.TransactionLedger.where('tripId').equals(trip.id).toArray();
   const existingTxMap = new Map(existingTxs.map((tx) => [tx.id, tx]));
+  const incomingTxIds = new Set(transactions.map((tx) => tx.id));
 
   let importedTxCount = 0;
   let updatedTxCount = 0;
@@ -817,13 +818,39 @@ export async function importSharedTripData(
         syncStatus: 'SYNCED',
         lifecycleStatus: 'SYNCED',
       });
-    } else if (tx.updatedAt && (!existing.updatedAt || tx.updatedAt > existing.updatedAt)) {
-      updatedTxCount += 1;
-      await saveTransactionLocal({
-        ...tx,
-        syncStatus: 'SYNCED',
-        lifecycleStatus: 'SYNCED',
-      });
+    } else {
+      const hasChanged =
+        existing.amountPaise !== tx.amountPaise ||
+        existing.title !== tx.title ||
+        existing.type !== tx.type ||
+        existing.isReversed !== tx.isReversed ||
+        existing.notes !== tx.notes ||
+        existing.fromMemberId !== tx.fromMemberId ||
+        existing.paidByMemberId !== tx.paidByMemberId ||
+        existing.paymentMethod !== tx.paymentMethod ||
+        existing.dateTime !== tx.dateTime ||
+        existing.updatedAt !== tx.updatedAt;
+
+      const isNewerOrEqual =
+        !existing.updatedAt || !tx.updatedAt || tx.updatedAt >= existing.updatedAt;
+
+      if (hasChanged && isNewerOrEqual) {
+        updatedTxCount += 1;
+        await saveTransactionLocal({
+          ...tx,
+          syncStatus: 'SYNCED',
+          lifecycleStatus: 'SYNCED',
+        });
+      }
+    }
+  }
+
+  // If incoming payload has transactions and any existing SYNCED transaction is absent from the snapshot, remove it
+  if (transactions.length > 0) {
+    for (const existing of existingTxs) {
+      if (existing.syncStatus === 'SYNCED' && !incomingTxIds.has(existing.id)) {
+        await deleteTransactionLocal(existing.id);
+      }
     }
   }
 
